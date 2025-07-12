@@ -9,6 +9,7 @@ from .create_event import create_event
 from .delete_event import delete_event
 from .edit_event import edit_event
 from .list_events import list_events
+from .logFitnessProfileJsonTool import logFitnessProfileJsonTool
 
 __all__ = [
     "create_event",
@@ -16,4 +17,5 @@ __all__ = [
     "edit_event",
     "list_events",
     "get_current_time",
+    'logFitnessProfileJsonTool'
 ]
