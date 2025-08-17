@@ -3,7 +3,7 @@ import base64
 import json
 import os
 from pathlib import Path
-from typing import AsyncIterable
+from typing import AsyncIterable,Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query, WebSocket
@@ -16,7 +16,9 @@ from google.adk.runners import Runner
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.genai import types
 from jarvis.agent import root_agent
-
+from utils.utility import get_model_configs,call_agent_async
+from utils.video_gen import generate_video_sequence
+from utils.video_editor import stitch_videos
 #
 # ADK Streaming
 #
@@ -182,6 +184,50 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 async def root():
     """Serves the index.html"""
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+
+
+@app.get("/generate-video")
+async def generate_video(topic: str, duration: Optional[int] = 30):
+    runner, session_id = get_model_configs(USER_ID="shajid")
+
+    raw_response = await call_agent_async(
+        runner=runner,
+        user_id="shajid",
+        session_id=session_id,
+        query=topic
+    )
+    try:
+        response = json.loads(raw_response)
+    except json.JSONDecodeError:
+        return {
+            "error": "Invalid JSON returned from agent",
+            "raw_response": raw_response
+        }
+
+    # Extract script if available
+    if isinstance(response, dict) and "script" in response:
+        # return {"response": response["script"]}
+        response = response["script"]
+    else:
+        return {"error": "No 'script' key in response", "parsed_response": response}
+    
+    result = generate_video_sequence(response, max_workers=2)
+
+    # return {
+    #     "response": result.get("response", []), # Ensure we return a list of results
+    #     "raw_response": raw_response     }
+
+    video_data = stitch_videos(result.get("response", []), output_path=f"genrated_video.mp4")
+
+    if video_data['success']:
+        return FileResponse(video_data["path"], media_type="video/mp4", filename="stitched_cat_video.mp4")
+    else:
+        return {"error": "Failed to stitch videos", "details": video_data}
+
+
+
+
+    
 
 
 @app.websocket("/ws/{session_id}")
