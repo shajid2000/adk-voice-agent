@@ -19,6 +19,12 @@ from jarvis.agent import root_agent
 from utils.utility import get_model_configs,call_agent_async
 from utils.video_gen import generate_video_sequence
 from utils.video_editor import stitch_videos
+
+from utils.video_generation import VideoProcessingPipeline, VideoGenerationConfig
+
+import time
+import logging
+from fastapi import HTTPException
 #
 # ADK Streaming
 #
@@ -186,46 +192,350 @@ async def root():
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
 
 
+# Import the optimized classes (assuming they're in a separate module)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Create FastAPI app
+app = FastAPI()
+
+# Global pipeline instance (optional - for reusing sessions)
+_video_pipeline = None
+
+def get_video_pipeline() -> VideoProcessingPipeline:
+    """Get or create video processing pipeline instance"""
+    global _video_pipeline
+    if _video_pipeline is None:
+        config = VideoGenerationConfig(
+            max_workers=2,  # Adjust based on your server capacity
+            timeout=300,    # 5 minutes timeout
+            max_retries=3,  # Retry failed generations
+            temp_dir="./temp_videos"  # Specify temp directory
+        )
+        # Create temp directory if it doesn't exist
+        os.makedirs(config.temp_dir, exist_ok=True)
+        _video_pipeline = VideoProcessingPipeline(config)
+    
+    return _video_pipeline
+
 @app.get("/generate-video")
 async def generate_video(topic: str, duration: Optional[int] = 30):
-    runner, session_id = get_model_configs(USER_ID="shajid")
-
-    raw_response = await call_agent_async(
-        runner=runner,
-        user_id="shajid",
-        session_id=session_id,
-        query=topic
-    )
-    try:
-        response = json.loads(raw_response)
-    except json.JSONDecodeError:
-        return {
-            "error": "Invalid JSON returned from agent",
-            "raw_response": raw_response
-        }
-
-    # Extract script if available
-    if isinstance(response, dict) and "script" in response:
-        # return {"response": response["script"]}
-        response = response["script"]
-    else:
-        return {"error": "No 'script' key in response", "parsed_response": response}
+    """
+    Generate video from topic using optimized pipeline
     
-    result = generate_video_sequence(response, max_workers=2)
+    Args:
+        topic: Video topic/description
+        duration: Video duration in seconds (not used in current implementation)
+    
+    Returns:
+        FileResponse with generated video or error response
+    """
+    try:
+        logger.info(f"Starting video generation for topic: {topic}")
+        
+        # Get model configs and call agent (your existing code)
+        runner, session_id = get_model_configs(USER_ID="shajid")
+        raw_response = await call_agent_async(
+            runner=runner,
+            user_id="shajid",
+            session_id=session_id,
+            query=topic
+        )
+        
+        # Parse the agent response
+        try:
+            response = json.loads(raw_response)
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse agent response: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "Invalid JSON returned from agent",
+                    "raw_response": raw_response[:500]  # Truncate for safety
+                }
+            )
+        
+        # Extract script from response
+        if isinstance(response, dict) and "script" in response:
+            scenes_data = response["script"]
+            logger.info(f"Extracted {len(scenes_data)} scenes from script")
+        else:
+            logger.error("No 'script' key found in agent response")
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "No 'script' key in response", 
+                    "parsed_response": response
+                }
+            )
+        
+        # Validate scenes data
+        if not scenes_data or not isinstance(scenes_data, list):
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "Invalid or empty scenes data"}
+            )
+        
+        # Get the optimized pipeline
+        pipeline = get_video_pipeline()
+        
+        # Generate unique output filename
+        timestamp = int(time.time())
+        safe_topic = "".join(c for c in topic[:20] if c.isalnum() or c in (' ', '_', '-')).strip()
+        output_filename = f"generated_video_{safe_topic}_{timestamp}.mp4"
+        output_path = f"./generated_videos/{output_filename}"
+        
+        # Create output directory if it doesn't exist
+        os.makedirs("./generated_videos", exist_ok=True)
+        
+        # Run the optimized pipeline
+        logger.info("Starting video generation and stitching pipeline...")
+        result = await pipeline.generate_and_stitch_video(scenes_data, output_path)
+        
+        if result.get('success'):
+            logger.info(f"Video generation successful: {result['path']}")
+            
+            # Verify file exists and has content
+            if not os.path.exists(result['path']) or os.path.getsize(result['path']) == 0:
+                raise HTTPException(
+                    status_code=500,
+                    detail={"error": "Generated video file is missing or empty"}
+                )
+            
+            return FileResponse(
+                result["path"],
+                media_type="video/mp4",
+                filename=f"{safe_topic}_video.mp4",
+                headers={
+                    "Content-Disposition": f"attachment; filename=\"{safe_topic}_video.mp4\"",
+                    "Cache-Control": "no-cache"
+                }
+            )
+        else:
+            logger.error(f"Video generation failed: {result}")
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "Failed to generate/stitch videos", 
+                    "details": result.get('error', 'Unknown error')
+                }
+            )
+            
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in video generation: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Internal server error during video generation",
+                "details": str(e)
+            }
+        )
 
-    # return {
-    #     "response": result.get("response", []), # Ensure we return a list of results
-    #     "raw_response": raw_response     }
 
-    video_data = stitch_videos(result.get("response", []), output_path=f"genrated_video.mp4")
+@app.delete("/clear-videos")
+async def clear_generated_videos():
+    """
+    Clear all generated videos from the generated_videos directory
+    
+    Returns:
+        Dictionary with operation status and details
+    """
+    try:
+        videos_dir = Path("./generated_videos")
+        temp_dir = Path("./temp_videos")
+        
+        deleted_files = []
+        errors = []
+        
+        # Clear generated_videos directory
+        if videos_dir.exists():
+            for file_path in videos_dir.iterdir():
+                try:
+                    if file_path.is_file():
+                        file_size = file_path.stat().st_size
+                        file_path.unlink()  # Delete the file
+                        deleted_files.append({
+                            "file": str(file_path.name),
+                            "size_bytes": file_size,
+                            "type": "generated_video"
+                        })
+                        logger.info(f"Deleted: {file_path.name}")
+                except Exception as e:
+                    error_msg = f"Failed to delete {file_path.name}: {str(e)}"
+                    errors.append(error_msg)
+                    logger.error(error_msg)
+        
+        # Clear temp_videos directory
+        if temp_dir.exists():
+            for file_path in temp_dir.iterdir():
+                try:
+                    if file_path.is_file():
+                        file_size = file_path.stat().st_size
+                        file_path.unlink()  # Delete the file
+                        deleted_files.append({
+                            "file": str(file_path.name),
+                            "size_bytes": file_size,
+                            "type": "temp_video"
+                        })
+                        logger.info(f"Deleted temp file: {file_path.name}")
+                except Exception as e:
+                    error_msg = f"Failed to delete temp file {file_path.name}: {str(e)}"
+                    errors.append(error_msg)
+                    logger.error(error_msg)
+        
+        # Calculate total space freed
+        total_bytes_freed = sum(file_info["size_bytes"] for file_info in deleted_files)
+        total_mb_freed = round(total_bytes_freed / (1024 * 1024), 2)
+        
+        response = {
+            "success": True,
+            "message": f"Cleanup completed. Deleted {len(deleted_files)} files",
+            "details": {
+                "files_deleted": len(deleted_files),
+                "total_size_freed_mb": total_mb_freed,
+                "deleted_files": deleted_files,
+                "errors": errors if errors else None
+            }
+        }
+        
+        logger.info(f"Cleanup completed: {len(deleted_files)} files deleted, {total_mb_freed}MB freed")
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error during cleanup: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Failed to clear generated videos",
+                "details": str(e)
+            }
+        )
 
-    if video_data['success']:
-        return FileResponse(video_data["path"], media_type="video/mp4", filename="stitched_cat_video.mp4")
-    else:
-        return {"error": "Failed to stitch videos", "details": video_data}
+
+@app.get("/clear-videos")
+async def delete_videos(file_name: str | None = Query(None, description="Optional file name to delete")):
+    """
+    Delete a specific video file or all video files from generated_videos directory
+    
+    Args:
+        file_name: Optional name of the video file to delete. If not provided, deletes all .mp4 files.
+        
+    Returns:
+        Dictionary with operation status
+    """
+    videos_dir = Path("./generated_videos")
+    videos_dir.mkdir(exist_ok=True)  # ensure directory exists
+
+    try:
+        if file_name:
+            # Delete specific file
+            safe_filename = os.path.basename(file_name)
+            if not safe_filename.endswith('.mp4'):
+                raise HTTPException(status_code=400, detail="Only .mp4 files can be deleted")
+
+            file_path = videos_dir / safe_filename
+            if not file_path.exists():
+                raise HTTPException(status_code=404, detail=f"File '{safe_filename}' not found")
+            file_size_mb = round(file_path.stat().st_size / (1024 * 1024), 2)
+            file_path.unlink()
+            logger.info(f"Deleted specific file: {safe_filename} ({file_size_mb}MB)")
+            return {
+                "success": True,
+                "message": f"Successfully deleted '{safe_filename}'",
+                "details": {"file_name": safe_filename, "size_freed_mb": file_size_mb}
+            }
+        else:
+            # Delete all .mp4 files
+            deleted_files = []
+            for file_path in videos_dir.glob("*.mp4"):
+                size_mb = round(file_path.stat().st_size / (1024 * 1024), 2)
+                file_path.unlink()
+                deleted_files.append({"file_name": file_path.name, "size_freed_mb": size_mb})
+                logger.info(f"Deleted file: {file_path.name} ({size_mb}MB)")
+
+            return {
+                "success": True,
+                "message": f"Deleted {len(deleted_files)} file(s)",
+                "details": deleted_files
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting videos: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete videos: {str(e)}")
 
 
-
+@app.get("/videos/list")
+async def list_generated_videos():
+    """
+    List all generated videos with their details
+    
+    Returns:
+        Dictionary with list of videos and directory info
+    """
+    try:
+        videos_dir = Path("./generated_videos")
+        temp_dir = Path("./temp_videos")
+        
+        video_files = []
+        temp_files = []
+        
+        # List generated videos
+        if videos_dir.exists():
+            for file_path in videos_dir.iterdir():
+                if file_path.is_file() and file_path.suffix.lower() == '.mp4':
+                    stat = file_path.stat()
+                    video_files.append({
+                        "name": file_path.name,
+                        "size_bytes": stat.st_size,
+                        "size_mb": round(stat.st_size / (1024 * 1024), 2),
+                        "created_time": time.ctime(stat.st_ctime),
+                        "modified_time": time.ctime(stat.st_mtime)
+                    })
+        
+        # List temp files
+        if temp_dir.exists():
+            for file_path in temp_dir.iterdir():
+                if file_path.is_file():
+                    stat = file_path.stat()
+                    temp_files.append({
+                        "name": file_path.name,
+                        "size_bytes": stat.st_size,
+                        "size_mb": round(stat.st_size / (1024 * 1024), 2),
+                        "created_time": time.ctime(stat.st_ctime)
+                    })
+        
+        # Calculate totals
+        total_video_size = sum(f["size_bytes"] for f in video_files)
+        total_temp_size = sum(f["size_bytes"] for f in temp_files)
+        total_size_mb = round((total_video_size + total_temp_size) / (1024 * 1024), 2)
+        
+        return {
+            "success": True,
+            "summary": {
+                "total_videos": len(video_files),
+                "total_temp_files": len(temp_files),
+                "total_size_mb": total_size_mb
+            },
+            "generated_videos": sorted(video_files, key=lambda x: x["modified_time"], reverse=True),
+            "temp_files": sorted(temp_files, key=lambda x: x["created_time"], reverse=True) if temp_files else []
+        }
+        
+    except Exception as e:
+        logger.error(f"Error listing videos: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Failed to list generated videos",
+                "details": str(e)
+            }
+        )
 
     
 

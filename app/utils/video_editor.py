@@ -23,6 +23,7 @@ def stitch_videos(video_data, output_path="final_video.mp4"):
     try:
         # Download each video and create VideoFileClip
         for item in video_data:
+            print(f"Processing video item: {item}")
             url = item.get("url")
             if not url:
                 continue
