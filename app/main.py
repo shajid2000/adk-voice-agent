@@ -417,59 +417,6 @@ async def clear_generated_videos():
         )
 
 
-@app.get("/clear-videos")
-async def delete_videos(file_name: str | None = Query(None, description="Optional file name to delete")):
-    """
-    Delete a specific video file or all video files from generated_videos directory
-    
-    Args:
-        file_name: Optional name of the video file to delete. If not provided, deletes all .mp4 files.
-        
-    Returns:
-        Dictionary with operation status
-    """
-    videos_dir = Path("./generated_videos")
-    videos_dir.mkdir(exist_ok=True)  # ensure directory exists
-
-    try:
-        if file_name:
-            # Delete specific file
-            safe_filename = os.path.basename(file_name)
-            if not safe_filename.endswith('.mp4'):
-                raise HTTPException(status_code=400, detail="Only .mp4 files can be deleted")
-
-            file_path = videos_dir / safe_filename
-            if not file_path.exists():
-                raise HTTPException(status_code=404, detail=f"File '{safe_filename}' not found")
-            file_size_mb = round(file_path.stat().st_size / (1024 * 1024), 2)
-            file_path.unlink()
-            logger.info(f"Deleted specific file: {safe_filename} ({file_size_mb}MB)")
-            return {
-                "success": True,
-                "message": f"Successfully deleted '{safe_filename}'",
-                "details": {"file_name": safe_filename, "size_freed_mb": file_size_mb}
-            }
-        else:
-            # Delete all .mp4 files
-            deleted_files = []
-            for file_path in videos_dir.glob("*.mp4"):
-                size_mb = round(file_path.stat().st_size / (1024 * 1024), 2)
-                file_path.unlink()
-                deleted_files.append({"file_name": file_path.name, "size_freed_mb": size_mb})
-                logger.info(f"Deleted file: {file_path.name} ({size_mb}MB)")
-
-            return {
-                "success": True,
-                "message": f"Deleted {len(deleted_files)} file(s)",
-                "details": deleted_files
-            }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error deleting videos: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to delete videos: {str(e)}")
-
 
 @app.get("/videos/list")
 async def list_generated_videos():

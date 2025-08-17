@@ -1,6 +1,12 @@
+import os
 from google.adk.agents import Agent
 from pydantic import BaseModel, Field
 from typing import List
+from dotenv import load_dotenv
+
+
+
+load_dotenv()
 
 
 # --- Define Output Schema ---
@@ -23,7 +29,7 @@ class ScriptOutput(BaseModel):
 
 
 # --- Define System Prompt ---
-video_duration = 30  # Total duration of the video in seconds
+video_duration = int(os.getenv("VIDEO_DURATION", 30))  # Total duration of the video in seconds
 
 systemPrompt = f"""
 You are a Script Agent.
